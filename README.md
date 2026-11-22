@@ -28,6 +28,15 @@ Works on current PS5 firmware (tested on 14.23). Single-player story mode only.
 2. Allow it through Windows Firewall when asked. The PS5 needs to reach your PC.
 3. Follow the four steps on screen: **Connect → Download → Edit → Send back**.
 
+### First time: pair your PS5
+
+You only do this once per console.
+
+1. In the app, pick your PS5 and click **Start pairing**.
+2. On the PS5, go to **Settings → System → System Software → Data Transfer**.
+3. Select **GarlicTransfer Pairing** in the list.
+4. The PS5 says it cannot transfer data. This is expected. Check the app: it shows that pairing is done.
+
 Things to know before you start:
 
 - Save in game first, then go back to the PS5 home screen.
@@ -100,6 +109,15 @@ GPL-3.0. See `LICENSE`.
 1. 下载最新版本，解压，运行 `GTA6SaveEditor.exe`，浏览器会自动打开界面。
 2. Windows 防火墙弹窗时选择允许。PS5 需要连到你的电脑。
 3. 按界面上的四步操作：**连接 → 下载 → 修改 → 传回**。
+
+#### 第一次使用：先配对
+
+每台主机只需要配对一次。
+
+1. 在修改器里选好你的 PS5，点「开始配对」。
+2. 在 PS5 上进入 **设定 → 系统 → 系统软件 → 数据传输**。
+3. 在列表里选择 **GarlicTransfer Pairing**。
+4. PS5 会提示“无法传输数据”，这是正常的。回到修改器，界面显示配对成功即可。
 
 开始前请注意：
 
