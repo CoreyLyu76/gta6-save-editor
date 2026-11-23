@@ -1,9 +1,58 @@
-"""GTA VI 解密后 JSAV 存档的金额读取与修改（与 web 版 core.js 同一套逻辑）。"""
+"""GTA VI 解密后 JSAV 存档的金额读取与修改。
+
+存档里钱的结构（2026-11 在 PS5 真机上逐项验证）：
+
+  库存 Inventories[n]（n = 0 / 1，两位主角）主列表是 6 个并列数组：
+    Guids / ParentGuidIndices / ItemIds / SlotIds / Quantities / EquippedFlags
+  ParentGuidIndices 是 ParentGuids 数组的下标，ParentGuids[下标] 是父物品的 Guid。
+  每一行还要在 Items 数组里登记一项 (行号 << 4) | 1，没登记的行游戏直接忽略。
+
+  钱是物品 currency_cash，数量就是金额。它放在「钱箱」物品里，钱箱挂在账户下面：
+
+    bank_checking ─ 钱箱 ─ currency_cash      活期
+    bank_savings  ─ 钱箱 ─ currency_cash      家庭储蓄，每完成一个储蓄目标游戏多给一个钱箱
+    钱包          ─ 钱箱 ─ currency_cash      现金（格子 slotid_currency_cash_20000）
+
+  游戏里的「限额」就是钱箱的容量：金额超过容量，读档时被压回容量。
+  要超过限额，得在账户下面加钱箱。物品和格子的编号是名字的 Jenkins one-at-a-time 哈希（joaat）。
+
+  另有三处镜像要跟着改，否则数字对不上：统计区（编号 262 活期、274 现金+活期、275 家庭储蓄）、
+  活期流水最后一条、储蓄流水最后一条。
+"""
 import json, struct
 
-MONEY_CAT = 2084597891
-TYPES = {2177639769: 'bank', 4163145158: 'cash'}
-STAT_BANK, STAT_CASH = 2027, (552, 3273)
+
+def joaat(name):
+    h = 0
+    for c in name.encode():
+        h = (h + c) & 0xffffffff; h = (h + (h << 10)) & 0xffffffff; h ^= h >> 6
+    h = (h + (h << 3)) & 0xffffffff; h ^= h >> 11
+    return (h + (h << 15)) & 0xffffffff
+
+
+MONEY_CAT = joaat('currency_cash')                      # 2084597891
+BOX_SLOT = joaat('slotid_currency_cash_container')      # 钱箱在账户下面占的格子
+CASH_SLOT = joaat('slotid_currency_cash_20000')         # 4163145158
+CASH_MAX = 20000
+# 三个大钱箱 (钱箱物品, 钱的格子, 容量)。编号由前两档储蓄钱箱的命名规律推出，游戏自带的解锁目录里有这三项。
+# 挂在储蓄账户和活期账户下面都有效（真机：储蓄 2,000,000，活期 1,985,000）。
+BIG_BOXES = ((0xa61b8949, joaat('slotid_currency_cash_400000'), 400000),
+             (0x6ab81283, joaat('slotid_currency_cash_500000'), 500000),
+             (0x88e64edf, joaat('slotid_currency_cash_1000000'), 1000000))
+ACCOUNTS = {
+    # 活期第 2 档钱箱的格子名没破解出来，只知道编号和容量。账户下还有一个空钱箱 0x26457c8e（推测 15,000），不动它。
+    'bank': (joaat('bank_checking'), ((0x33894998, 2177639769, 85000),) + BIG_BOXES),
+    'savings': (joaat('bank_savings'), ((0xcfefdcf1, joaat('slotid_currency_cash_5000'), 5000),
+                                        (0xb84a2da6, joaat('slotid_currency_cash_95000'), 95000)) + BIG_BOXES),
+}
+STAT_CASH = (552, 3273)
+STAT_CHECKING, STAT_CASH_PLUS_CHECKING, STAT_SAVINGS = 262, 274, 275
+SEC_INV, SEC_STAT, SEC_LEDGER = 0xd3f59a5e, 0x0635cbd9, 0x6296c122
+K_MAIN, K_GUID, K_PARENT, K_ITEM, K_SLOT, K_QTY, K_FLAG = '$0xfc8f2620', '$0xb4bfeab1', '$0xc5730137', '$0xbe8e255c', '$0x12ae4287', '$0xe3fead7a', '$0x63b44f39'
+K_ITEMS, K_PARENTS = '$0xabb1e011', '$0xd558e4da'
+K_SUBLISTS = ('$0x6ebbccb1', '$0xc500ddf4', '$0x9098d12e', '$0x1085013f')
+LEDGER_CHECKING, LEDGER_SAVINGS = '$0x1e1e8a08', '$0xf4a14422'
+K_ENTRY, K_OWNER, K_DELTA, K_BALANCE = '$0x9d8e7980', '$0x6d0bd92f', '$0xa662d8be', '$0x818f6f6d'
 
 
 class SaveError(Exception):
@@ -21,92 +70,7 @@ def _load(b):
     return ents, secs, gaps, b[:ents[0][3]], b[end:end + 4]
 
 
-def _sec(ents, h):
-    for i, e in enumerate(ents):
-        if e[0] == h:
-            return i
-    raise SaveError('layout_changed')
-
-
-def _inv_span(txt, nth):
-    p = txt.index(b'"$0x789bdd41":')
-    for _ in range(nth + 1):
-        p = txt.index(b'"$0xfc8f2620":', p + 1)
-    p = txt.index(b'"$0xe3fead7a":', p)
-    s = txt.index(b'[', p) + 1
-    return s, txt.index(b']', s)
-
-
-def _stat_span(txt):
-    p = txt.index(b'"$0x97232209":'); p = txt.index(b'"$0x450ce2f0":', p)
-    s = txt.index(b'[', p) + 1
-    return s, txt.index(b']', s)
-
-
-def _set(txt, span, idx, old, new):
-    it = txt[span[0]:span[1]].split(b',')
-    if it[idx] != str(old).encode():
-        raise SaveError('verify_failed')
-    it[idx] = str(new).encode()
-    return txt[:span[0]] + b','.join(it) + txt[span[1]:]
-
-
-def scan(b):
-    ents, secs, _, _, _ = _load(b)
-    invs = json.loads(secs[_sec(ents, 0xd3f59a5e)])['$0x7a47cb05']['$0xd3f59a5e']['$0x789bdd41']
-    items = []
-    for n, inv in enumerate(invs):
-        f = inv.get('$0xfc8f2620') or {}
-        q = (f.get('$0xe3fead7a') or {}).get('$data'); c = (f.get('$0xbe8e255c') or {}).get('$data'); t = (f.get('$0x12ae4287') or {}).get('$data')
-        if not q:
-            continue
-        for k, v in enumerate(q):
-            if c[k] == MONEY_CAT:
-                items.append({'inv': n, 'idx': k, 'type': t[k], 'kind': TYPES.get(t[k], 'other'), 'value': v})
-    stats = json.loads(secs[_sec(ents, 0x0635cbd9)])['$0x7a47cb05']['$0x0635cbd9']['$0x97232209']['$0x450ce2f0']['$data']
-    ledger = None
-    try:
-        l = json.loads(secs[_sec(ents, 0x6296c122)])['$0x24d043f2']['$0x6296c122']['$0x45a134ec']['$0x1e1e8a08'][-1]
-        ledger = {'amount': l['$0xa662d8be'], 'balance': l['$0x818f6f6d']}
-    except Exception:
-        pass
-    return {'items': items, 'statBank': stats[STAT_BANK], 'statCash': [stats[i] for i in STAT_CASH], 'ledger': ledger}
-
-
-def patch(b, changes):
-    """changes: [{inv, idx, value(旧值), newValue}] -> (新文件 bytes, 说明列表)"""
-    ents, secs, gaps, head, tail = _load(b)
-    info = scan(b); log = []
-    i_inv, i_stat = _sec(ents, 0xd3f59a5e), _sec(ents, 0x0635cbd9)
-    for ch in changes:
-        it = next((x for x in info['items'] if x['inv'] == ch['inv'] and x['idx'] == ch['idx']), None)
-        if not it or it['value'] != ch['value']:
-            raise SaveError('stale_item')
-        nv = int(round(ch['newValue']))
-        if not 0 <= nv <= 2147483647:
-            raise SaveError('out_of_range')
-        if nv == it['value']:
-            continue
-        secs[i_inv] = _set(secs[i_inv], _inv_span(secs[i_inv], it['inv']), it['idx'], it['value'], nv)
-        log.append({'what': 'inventory', 'kind': it['kind'], 'from': it['value'], 'to': nv})
-        if it['kind'] == 'bank':
-            if info['statBank'] == it['value']:
-                secs[i_stat] = _set(secs[i_stat], _stat_span(secs[i_stat]), STAT_BANK, it['value'], nv); log.append({'what': 'stat_bank'})
-            led = info['ledger']
-            if led and led['balance'] == it['value']:
-                i_led = _sec(ents, 0x6296c122)
-                t = b'"$0xa662d8be":%d,"$0x818f6f6d":%d}' % (led['amount'], led['balance'])
-                k = secs[i_led].rfind(t)
-                if k < 0:
-                    raise SaveError('ledger_not_found')
-                secs[i_led] = secs[i_led][:k] + b'"$0xa662d8be":%d,"$0x818f6f6d":%d}' % (led['amount'] + nv - it['value'], nv) + secs[i_led][k + len(t):]
-                log.append({'what': 'ledger'})
-            else:
-                log.append({'what': 'ledger_skipped'})
-        elif it['kind'] == 'cash':
-            for j, si in enumerate(STAT_CASH):
-                if info['statCash'][j] == it['value']:
-                    secs[i_stat] = _set(secs[i_stat], _stat_span(secs[i_stat]), si, it['value'], nv); log.append({'what': 'stat_cash'})
+def _rebuild(head, ents, secs, gaps, tail, min_len):
     out = bytearray(head)
     for i, s in enumerate(secs):
         json.loads(s)
@@ -117,6 +81,259 @@ def patch(b, changes):
     for i, e in enumerate(ents):
         struct.pack_into('<IIIII', out, 16 + 20 * i, *e)
     out += b'\0' * ((-len(out)) % 16)
-    if len(out) < len(b):
-        out += b'\0' * (len(b) - len(out))
-    return bytes(out), log
+    if len(out) < min_len:
+        out += b'\0' * (min_len - len(out))
+    return bytes(out)
+
+
+def _sec(ents, h):
+    for i, e in enumerate(ents):
+        if e[0] == h:
+            return i
+    raise SaveError('layout_changed')
+
+
+# ---- 按字节改，不重排 JSON：游戏对格式敏感，原文保持不动最稳 ----
+
+def _main(txt, nth):
+    """第 nth 个库存主列表的起始位置。"""
+    p = txt.index(b'"$0x789bdd41":')
+    for _ in range(nth + 1):
+        p = txt.index(b'"%s":' % K_MAIN.encode(), p + 1)
+    return p
+
+
+def _array_end(txt, nth, key):
+    """第 nth 个库存里（主列表起）第一个 key 数组的 ']' 位置。"""
+    return txt.index(b']', txt.index(b'"%s":' % key.encode(), _main(txt, nth)))
+
+
+def _append(txt, nth, key, value):
+    e = _array_end(txt, nth, key)
+    return txt[:e] + b',' + value + txt[e:]
+
+
+def _set(txt, span, idx, old, new):
+    it = txt[span[0]:span[1]].split(b',')
+    if it[idx] != str(old).encode():
+        raise SaveError('verify_failed')
+    it[idx] = str(new).encode()
+    return txt[:span[0]] + b','.join(it) + txt[span[1]:]
+
+
+def _qty_span(txt, nth):
+    e = _array_end(txt, nth, K_QTY)
+    return txt.rindex(b'[', 0, e) + 1, e
+
+
+def _stat_span(txt):
+    p = txt.index(b'"$0x97232209":'); p = txt.index(b'"$0x450ce2f0":', p)
+    s = txt.index(b'[', p) + 1
+    return s, txt.index(b']', s)
+
+
+def _ledger_set(txt, list_key, entry_id, delta, balance, new_delta, new_balance):
+    s = txt.index(b'"%s":[' % list_key.encode()); e = txt.index(b']', s)
+    k = txt.rfind(b'"%s":%d,' % (K_ENTRY.encode(), entry_id), s, e)
+    old = b'"%s":%d,"%s":%d}' % (K_DELTA.encode(), delta, K_BALANCE.encode(), balance)
+    k = txt.find(old, k, e) if k >= 0 else -1
+    if k < 0:
+        raise SaveError('ledger_not_found')
+    return txt[:k] + b'"%s":%d,"%s":%d}' % (K_DELTA.encode(), new_delta, K_BALANCE.encode(), new_balance) + txt[k + len(old):]
+
+
+# ---- 读 ----
+
+def _data(x):
+    return (x.get('$data') or []) if isinstance(x, dict) else (x or [])
+
+
+def _inventory(sec_txt, nth):
+    inv = json.loads(sec_txt)['$0x7a47cb05']['$0xd3f59a5e']['$0x789bdd41'][nth]
+    f = inv.get(K_MAIN) or {}
+    v = {'guid': _data(f.get(K_GUID)), 'parent': _data(f.get(K_PARENT)), 'item': _data(f.get(K_ITEM)), 'slot': _data(f.get(K_SLOT)),
+         'qty': _data(f.get(K_QTY)), 'parents': _data(inv.get(K_PARENTS))}
+    v['used'] = set(v['guid']) | set(v['parents'])
+    for k in K_SUBLISTS:
+        v['used'] |= set(_data((inv.get(k) or {}).get(K_GUID)))
+    return v
+
+
+def _children(v, row):
+    """挂在第 row 行物品下面的行号。"""
+    g = v['guid'][row]
+    if g not in v['parents']:
+        return []
+    p = v['parents'].index(g)
+    return [r for r in range(len(v['guid'])) if v['parent'][r] == p and r != row]
+
+
+def _account(v, kind):
+    """账户下的钱箱：[{box 物品, box_row, money_row 或 None, qty, cap 或 None}]，没有这个账户返回 None。"""
+    root_item, table = ACCOUNTS[kind]
+    if root_item not in v['item']:
+        return None
+    caps = {box: cap for box, _, cap in table}
+    out = []
+    for r in _children(v, v['item'].index(root_item)):
+        if v['slot'][r] != BOX_SLOT:
+            continue
+        m = next((c for c in _children(v, r) if v['item'][c] == MONEY_CAT), None)
+        out.append({'box': v['item'][r], 'box_row': r, 'money_row': m, 'qty': v['qty'][m] if m is not None else 0, 'cap': caps.get(v['item'][r])})
+    return out
+
+
+def scan(b):
+    ents, secs, _, _, _ = _load(b)
+    inv_txt = secs[_sec(ents, SEC_INV)]
+    n_inv = len(json.loads(inv_txt)['$0x7a47cb05']['$0xd3f59a5e']['$0x789bdd41'])
+    items = []
+    for n in range(n_inv):
+        v = _inventory(inv_txt, n)
+        if not v['qty']:
+            continue
+        seen = set()
+        for kind in ('bank', 'savings'):
+            boxes = _account(v, kind)
+            rows = [x['money_row'] for x in boxes or [] if x['money_row'] is not None]
+            if not rows:
+                continue
+            seen |= set(rows)
+            items.append({'inv': n, 'idx': rows[0], 'type': v['slot'][rows[0]], 'kind': kind, 'value': sum(x['qty'] for x in boxes),
+                          'max': sum(cap for _, _, cap in ACCOUNTS[kind][1]) + sum(x['qty'] for x in boxes if x['cap'] is None)})
+        for k, q in enumerate(v['qty']):
+            if v['item'][k] == MONEY_CAT and k not in seen:
+                cash = v['slot'][k] == CASH_SLOT
+                items.append(dict({'inv': n, 'idx': k, 'type': v['slot'][k], 'kind': 'cash' if cash else 'other', 'value': q}, **({'max': CASH_MAX} if cash else {})))
+    items.sort(key=lambda x: (x['inv'], x['idx']))
+    st = json.loads(secs[_sec(ents, SEC_STAT)])['$0x7a47cb05']['$0x0635cbd9']['$0x97232209']
+    stats = st['$0x450ce2f0']['$data']
+    info = {'items': items, 'stats': stats, 'statIds': st['$0x92f37a48']['$data'], 'statChars': st['$0x46be9d78']['$data'],
+            'statCash': [stats[i] for i in STAT_CASH], 'ledger': None, 'savings': None, 'ledgers': {}}
+    try:
+        book = json.loads(secs[_sec(ents, SEC_LEDGER)])['$0x24d043f2']['$0x6296c122']['$0x45a134ec']
+        for l in book[LEDGER_CHECKING]:                     # 两位主角的活期流水混在一起，各取最后一条
+            info['ledgers'][l[K_OWNER] - 0xc0000002] = {'entry': l[K_ENTRY], 'amount': l[K_DELTA], 'balance': l[K_BALANCE]}
+        info['ledger'] = info['ledgers'].get(0)
+        l = book[LEDGER_SAVINGS][-1]
+        info['savings'] = {'entry': l[K_ENTRY], 'amount': l[K_DELTA], 'balance': l[K_BALANCE]}
+    except Exception:
+        pass
+    return info
+
+
+def same_item(item, change):
+    return item.get('src', 'inv') == change.get('src', 'inv') and item['inv'] == change['inv'] and item['idx'] == change['idx']
+
+
+# ---- 改 ----
+
+def _fresh_guid(v):
+    g = max(v['guid']) + 1
+    while g in v['used']:
+        g += 1
+    v['used'].add(g)
+    return g
+
+
+def _add_row(txt, nth, v, parent_idx, item, slot, qty):
+    """主列表加一行并登记到 Items，返回 (新文本, 行号, Guid)。"""
+    g = _fresh_guid(v); row = len(v['guid'])
+    for key, val in ((K_GUID, g), (K_PARENT, parent_idx), (K_ITEM, item), (K_SLOT, slot), (K_QTY, qty)):
+        txt = _append(txt, nth, key, b'%d' % val)
+    txt = _append(txt, nth, K_FLAG, b'false')
+    txt = _append(txt, nth, K_ITEMS, b'%d' % ((row << 4) | 1))
+    return txt, row, g
+
+
+def _parent_index(txt, nth, guid):
+    """Guid 在 ParentGuids 里的下标，没有就加在末尾。"""
+    v = _inventory(txt, nth)
+    if guid in v['parents']:
+        return txt, v['parents'].index(guid)
+    return _append(txt, nth, K_PARENTS, b'%d' % guid), len(v['parents'])
+
+
+def _set_account(txt, nth, kind, target):
+    """把账户合计改成 target：先装满已有的钱箱，不够再按容量从小到大加钱箱。"""
+    root_item, table = ACCOUNTS[kind]
+    boxes = _account(_inventory(txt, nth), kind)
+    left = target - sum(x['qty'] for x in boxes if x['cap'] is None)
+    if left < 0:
+        raise SaveError('out_of_range')
+    for box, slot, cap in table:
+        amount = min(cap, left); left -= amount
+        v = _inventory(txt, nth)
+        cur = next((x for x in _account(v, kind) if x['box'] == box), None)
+        if cur and cur['money_row'] is not None:
+            if cur['qty'] != amount:
+                txt = _set(txt, _qty_span(txt, nth), cur['money_row'], cur['qty'], amount)
+            continue
+        if not amount:
+            continue
+        if cur:
+            box_guid = v['guid'][cur['box_row']]
+        else:
+            txt, root_idx = _parent_index(txt, nth, v['guid'][v['item'].index(root_item)])
+            txt, _, box_guid = _add_row(txt, nth, _inventory(txt, nth), root_idx, box, BOX_SLOT, 1)
+        txt, box_idx = _parent_index(txt, nth, box_guid)
+        txt, _, _ = _add_row(txt, nth, _inventory(txt, nth), box_idx, MONEY_CAT, slot, amount)
+    if left:
+        raise SaveError('out_of_range')
+    return txt
+
+
+def patch(b, changes):
+    """changes: [{inv, idx, value(旧值), newValue}] -> (新文件 bytes, 说明列表)。超过上限的数按上限写。"""
+    ents, secs, gaps, head, tail = _load(b)
+    info = scan(b); log = []
+    i_inv, i_stat = _sec(ents, SEC_INV), _sec(ents, SEC_STAT)
+
+    def stat(si, old, new):
+        secs[i_stat] = _set(secs[i_stat], _stat_span(secs[i_stat]), si, old, new)
+
+    for ch in changes:
+        it = next((x for x in info['items'] if same_item(x, ch)), None)
+        if not it or it['value'] != ch['value']:
+            raise SaveError('stale_item')
+        nv = int(round(ch['newValue']))
+        if not 0 <= nv <= 2147483647:
+            raise SaveError('out_of_range')
+        nv = min(nv, it.get('max', nv)); old = it['value']
+        if nv == old:
+            continue
+        if it['kind'] in ACCOUNTS:
+            secs[i_inv] = _set_account(secs[i_inv], it['inv'], it['kind'], nv)
+        else:
+            secs[i_inv] = _set(secs[i_inv], _qty_span(secs[i_inv], it['inv']), it['idx'], old, nv)
+        log.append({'what': 'inventory', 'kind': it['kind'], 'from': old, 'to': nv})
+        ids, chars, vals = info['statIds'], info['statChars'], info['stats']
+        if it['kind'] == 'bank':
+            for si, sid in enumerate(ids):                  # 统计区的角色 1 / 2 对应库存 0 / 1
+                if chars[si] != it['inv'] + 1:
+                    continue
+                if sid == STAT_CHECKING and vals[si] == old:
+                    stat(si, old, nv); log.append({'what': 'stat_bank'})
+                elif sid == STAT_CASH_PLUS_CHECKING and vals[si] >= old:
+                    stat(si, vals[si], vals[si] - old + nv); log.append({'what': 'stat_bank'})
+            led = info['ledgers'].get(it['inv'])
+            if led:     # 流水最后一条的余额应当等于活期；以前只改库存留下的不一致也在这里一并改正
+                i_led = _sec(ents, SEC_LEDGER)
+                secs[i_led] = _ledger_set(secs[i_led], LEDGER_CHECKING, led['entry'], led['amount'], led['balance'], led['amount'] + nv - led['balance'], nv)
+                log.append({'what': 'ledger'})
+            else:
+                log.append({'what': 'ledger_skipped'})
+        elif it['kind'] == 'savings':
+            for si, sid in enumerate(ids):
+                if sid == STAT_SAVINGS and vals[si] == old:
+                    stat(si, old, nv); log.append({'what': 'stat_savings'})
+            sav = info['savings']
+            if sav:
+                i_led = _sec(ents, SEC_LEDGER)
+                secs[i_led] = _ledger_set(secs[i_led], LEDGER_SAVINGS, sav['entry'], sav['amount'], sav['balance'], sav['amount'] + nv - sav['balance'], nv)
+                log.append({'what': 'savings_ledger'})
+        elif it['kind'] == 'cash':
+            for j, si in enumerate(STAT_CASH):
+                if info['statCash'][j] == old:
+                    stat(si, old, nv); log.append({'what': 'stat_cash'})
+    return _rebuild(head, ents, secs, gaps, tail, len(b)), log

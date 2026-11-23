@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import time
 import sqlite3
 import struct
 import sys
@@ -163,13 +164,65 @@ def derive_session(sock, oracle_host, oracle_port, client_value, server_value):
     return derive_with_oracle(oracle_host, oracle_port, client_value, server_value)
 
 
+LAST_SEARCH = [None, 0.0]           # (address, monotonic time) of the console's latest SRCH
+BUSY = threading.Event()            # set while a command connection is being served
+
+
+def srch_response():
+    return (
+        b"HTTP/1.1 200 Ok\n"
+        b"host-id:" + HOST_ID + b"\n"
+        b"host-request-port:" + str(COMMAND_PORT).encode() + b"\n"
+        b"device-discovery-protocol-version:00030010\n"
+        b"host-type:PS5\n"
+        b"host-name:" + HOST_NAME + b"\n"
+        b"system-version:" + SYSTEM_VERSION + b"\n"
+    )
+
+
+def advertise(sock, console_ip):
+    """Keep answering without waiting for a SRCH.
+
+    On Wi-Fi (seen on macOS) the console's broadcast SRCH often does not
+    arrive, in part or at all, and the console only lists a host whose
+    answers keep coming.  So: once a SRCH has shown the console's port, repeat
+    the answer to it every second; before that, send the answer to every port
+    the console could be searching from.
+    """
+    rounds = 0
+    while True:
+        time.sleep(1.0)
+        if BUSY.is_set():
+            continue
+        address, seen = LAST_SEARCH
+        try:
+            if address and address[0] == console_ip and time.monotonic() - seen < 60:
+                sock.sendto(srch_response(), address)
+                continue
+            rounds += 1
+            if rounds % 2:
+                continue
+            response = srch_response()
+            for port in range(49152, 65536):
+                sock.sendto(response, (console_ip, port))
+                if port % 512 == 0:
+                    time.sleep(0.002)
+        except OSError as exc:
+            if rounds % 30 == 1:
+                print(f"[ddp] advertise: {exc}", flush=True)
+
+
 def discovery_server(port, ipv6=False):
     global DATA_ADDRESS
     family = socket.AF_INET6 if ipv6 else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform != "darwin":   # macOS: plain bind, the state every Mac send-back was verified in
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("::" if ipv6 else "0.0.0.0", port))
     print(f"[ddp] listening on UDP {port}", flush=True)
+    console_ip = os.environ.get("DT_CONSOLE_IP", "")
+    if console_ip and not ipv6:
+        threading.Thread(target=advertise, args=(sock, console_ip), daemon=True).start()
     while True:
         data, address = sock.recvfrom(4096)
         command = data.split(b" ", 1)[0]
@@ -188,15 +241,8 @@ def discovery_server(port, ipv6=False):
                 print(f"[ddp] advertising data address {detected} (route toward "
                       f"{address[0]}), data port {DATA_PORT}", flush=True)
         if command == b"SRCH":
-            response = (
-                b"HTTP/1.1 200 Ok\n"
-                b"host-id:" + HOST_ID + b"\n"
-                b"host-request-port:" + str(COMMAND_PORT).encode() + b"\n"
-                b"device-discovery-protocol-version:00030010\n"
-                b"host-type:PS5\n"
-                b"host-name:" + HOST_NAME + b"\n"
-                b"system-version:" + SYSTEM_VERSION + b"\n"
-            )
+            response = srch_response()
+            LAST_SEARCH[:] = [address, time.monotonic()]
         else:
             response = (
                 b"HTTP/1.1 200 Ok\n"
@@ -502,6 +548,15 @@ def serve_data(client, oracle_host, oracle_port):
             break
 
 
+def open_data_listener(family, bind_address, args):
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((bind_address, DATA_PORT))
+    listener.listen(1)
+    threading.Thread(target=data_server, args=(listener, args.oracle_host, args.oracle_port), daemon=True).start()
+    return listener
+
+
 def main():
     global DATA_ADDRESS, ADDRESS_PINNED, COMMAND_PORT, DATA_PORT, SYSTEM_VERSION
     parser = argparse.ArgumentParser(description="Local PS5 Data Transfer source emulator")
@@ -542,11 +597,9 @@ def main():
     sys.stderr = sys.stdout
     threading.Thread(target=interactive_console, daemon=True).start()
 
-    data_listener = socket.socket(family, socket.SOCK_STREAM)
-    data_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    data_listener.bind((bind_address, DATA_PORT))
-    data_listener.listen(1)
-    threading.Thread(target=data_server, args=(data_listener, args.oracle_host, args.oracle_port), daemon=True).start()
+    data_listener = None
+    if sys.platform != "darwin":
+        data_listener = open_data_listener(family, bind_address, args)
     listener = socket.socket(family, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((bind_address, args.port))
@@ -556,12 +609,17 @@ def main():
     while True:
         client, address = listener.accept()
         print(f"[tcp] connection from {address}", flush=True)
+        if data_listener is None:
+            # macOS: the data port opens when the PS5 connects (the state every Mac send-back was verified in).
+            data_listener = open_data_listener(family, bind_address, args)
+        BUSY.set()
         with client:
             client.settimeout(310)
             try:
                 serve_command(client, args.oracle_host, args.oracle_port)
             except (EOFError, OSError, ValueError) as exc:
                 print(f"[cmd] session ended: {exc}", flush=True)
+        BUSY.clear()
         print(f"[tcp] waiting for the next command connection on {args.port}", flush=True)
 
 

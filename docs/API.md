@@ -23,9 +23,9 @@ UI 的工作方式：**每秒轮询一次 `GET /api/state`，按返回内容渲�
       "subtitle": "偷欢快感",     // 存档在主机上显示的标题（任务名）
       "revision": "…",           // 越大越新，可用来标“最新”
       "items": [                 // 这个存档里的每一笔钱
-        {"inv": 0, "idx": 329, "kind": "bank",  "value": 5000},
-        {"inv": 0, "idx": 303, "kind": "cash",  "value": 20000},
-        {"inv": 0, "idx": 332, "kind": "other", "value": 5000}
+        {"inv": 0, "idx": 384, "kind": "bank",    "value": 85000,  "max": 1985000},
+        {"inv": 0, "idx": 387, "kind": "savings", "value": 100000, "max": 2000000},
+        {"inv": 0, "idx": 303, "kind": "cash",    "value": 20000,  "max": 20000}
       ],
       "ledger": {"amount": -30000, "balance": 5000} | null,
       "modified": false,
@@ -46,7 +46,9 @@ UI 的工作方式：**每秒轮询一次 `GET /api/state`，按返回内容渲�
 }
 ```
 
-`items[].kind`：`bank` 活期、`cash` 现金、`other` 未识别的钱类项目（默认不建议改）。
+`items[].kind`：`bank` 活期（账户合计）、`savings` 家庭储蓄（账户合计）、`cash` 现金、`other` 未识别的钱类项目（默认不建议改）。
+`max` 是这一项能写到的最大值。`bank` 和 `savings` 超过当前限额时，程序会在账户下面补钱箱（见 README「限额是怎么回事」）。新值大于 `max` 时按 `max` 写。
+存档槽除了手动存档 `sdimg_SAVEDATASARC…`，还有自动存档 `sdimg_sce_sdmemory`，格式相同。
 `cash` 可能有两笔，`inv` 不同代表两个主角（`inv` 0 和 1），游戏内谁是谁目前没有对应表，界面写「角色 1 / 角色 2」。
 余额为 0 的项目在存档里不存在，不会出现在列表里。
 

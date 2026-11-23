@@ -5,3 +5,5 @@ docs/CODEX-PROMPT-3.md
 __pycache__/
 *.pyc
 *.spec
+.venv/
+/data

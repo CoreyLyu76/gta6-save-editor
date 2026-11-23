@@ -8,9 +8,13 @@ import money, garlic
 FROZEN = getattr(sys, 'frozen', False)
 ROOT = Path(getattr(sys, '_MEIPASS', None) or Path(__file__).resolve().parent.parent)
 VENDOR, UI = ROOT / 'vendor', ROOT / 'ui'
+MAC = sys.platform == 'darwin'
 # 打包后程序目录只读，运行数据放到用户目录
-DATA = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'GTA6SaveEditor' if FROZEN else ROOT / 'data'
-VERSION = '0.1.0'
+APP_SUPPORT = Path.home() / 'Library' / 'Application Support' if MAC else Path(os.environ.get('LOCALAPPDATA', str(Path.home())))
+DATA = APP_SUPPORT / 'GTA6SaveEditor' if FROZEN else ROOT / 'data'
+# GarlicTransfer（Electron）的用户数据目录
+GT_DIR = Path.home() / 'Library' / 'Application Support' / 'garlic-transfer' if MAC else Path(os.environ.get('APPDATA', '')) / 'garlic-transfer'
+VERSION = '0.2.0'
 PORT = int(os.environ.get('GSE_PORT', '46606'))
 GTA_TITLES = ['PPSA01547', 'PPSA38500']          # GTA VI 各区版本
 NOWIN = 0x08000000 if os.name == 'nt' else 0
@@ -71,7 +75,7 @@ def refresh_paired():
         STATE['paired'] = False; return
     p = prefix_path()
     if not p.is_file():                      # 沿用本机 GarlicTransfer 已有的配对
-        old = Path(os.environ.get('APPDATA', '')) / 'garlic-transfer' / 'pairings' / ('%s-%s' % (c['hostId'].upper(), c['firmware'].upper())) / 'pairing-prefix.bin'
+        old = GT_DIR / 'pairings' / ('%s-%s' % (c['hostId'].upper(), c['firmware'].upper())) / 'pairing-prefix.bin'
         if old.is_file() and old.stat().st_size == 32:
             p.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(old, p)
     STATE['paired'] = p.is_file() and p.stat().st_size == 32
@@ -140,14 +144,55 @@ def run_tool(args, timeout=120):
 
 
 # ---------------- 各步骤 ----------------
-def discover():
+def local_ipv4s():
+    """本机各网卡的 (IP, 广播地址)。macOS 上 gethostbyname_ex 常只解析出 127.0.0.1，改读 ifconfig。"""
+    if MAC:
+        txt = subprocess.run(['/sbin/ifconfig'], capture_output=True, text=True, timeout=5).stdout
+        return re.findall(r'inet (\d+\.\d+\.\d+\.\d+) netmask \S+ broadcast (\d+\.\d+\.\d+\.\d+)', txt)
     import socket
+    return [(ip, ip.rsplit('.', 1)[0] + '.255') for ip in set(socket.gethostbyname_ex(socket.gethostname())[2])]
+
+
+def sweep(timeout=2.5):
+    """广播没人回时，向本机所在 /24 的每个地址单播 SRCH。有的路由器不把广播转给主机（实测：Mac 走 Wi-Fi 时 PS5 不回广播，单播会回）。"""
+    import socket, select
+    from poc.dt_discovery import SRCH, parse_response
+    found, socks = {}, []
+    try:
+        for ip, _ in local_ipv4s():
+            if ip.startswith(('127.', '169.254.', '198.18.')):
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); socks.append(s)
+            s.bind((ip, 0)); s.setblocking(False)
+            for n in range(1, 255):
+                host = ip.rsplit('.', 1)[0] + '.%d' % n
+                if host != ip:
+                    try:
+                        s.sendto(SRCH, (host, 1006))
+                    except OSError:
+                        pass
+        end = time.time() + timeout
+        while socks and time.time() < end:
+            for s in select.select(socks, [], [], 0.2)[0]:
+                try:
+                    d, a = s.recvfrom(4096)
+                except OSError:
+                    continue
+                if d.startswith(b'HTTP/1.1'):
+                    found[a[0]] = parse_response(d, a)
+    finally:
+        for s in socks:
+            s.close()
+    return list(found.values())
+
+
+def discover():
     routes = [{'bind': '', 'target': '255.255.255.255'}]
     try:                                        # 每块网卡的子网广播各发一次，全局广播在有虚拟网卡/代理时常走错口
-        for ip in set(socket.gethostbyname_ex(socket.gethostname())[2]):
+        for ip, bc in local_ipv4s():
             if not ip.startswith(('127.', '169.254.', '198.18.')):
-                routes.append({'bind': ip, 'target': ip.rsplit('.', 1)[0] + '.255'})
-    except OSError:
+                routes.append({'bind': ip, 'target': bc})
+    except (OSError, subprocess.SubprocessError):
         pass
     out = run_tool(['poc.dt_discovery', '--timeout', '3', '--routes', json.dumps(routes)], timeout=30)
     cons = json.loads(out.strip().splitlines()[-1])['consoles']
@@ -159,6 +204,11 @@ def discover():
                 cons.append(c)
     except Exception:
         pass
+    if not cons:
+        try:
+            cons = sweep()
+        except (OSError, subprocess.SubprocessError):
+            pass
     # 过滤掉本机上冒充主机的传输进程（hostId 02000000xxxx）
     return [{'host': c['host'], 'name': c['name'], 'hostId': c['hostId'], 'firmware': c['firmware']} for c in cons
             if c.get('hostId') and not c['hostId'].startswith('0200000000') and not c['host'].startswith('127.')]
@@ -216,7 +266,16 @@ def load_slot(sess, name, enc_path):
     """解密一个存档槽并读出金额。"""
     dec_root = sess / 'dec'
     top = Path(G.decrypt(str(enc_path), str(dec_root), on_status=lambda s: log('decrypt %s: %s' % (name, s))))
-    inner = name.replace('sdimg_SAVEDATA', '')
+    return read_slot(name, top)
+
+
+# sce_sdmemory 是游戏的自动存档（「继续游戏」读的就是它），里面的 memory.dat 和手动存档同一格式
+SLOT_RE = re.compile(r'sdimg_(SAVEDATASARC\d+|sce_sdmemory)')
+
+
+def read_slot(name, top):
+    """从已解密的目录读出一个存档槽的金额。"""
+    inner = 'memory.dat' if name == 'sdimg_sce_sdmemory' else name.replace('sdimg_SAVEDATA', '')
     f = top / inner
     if not f.is_file():
         raise Fail('unexpected_save_layout', name)
@@ -224,6 +283,52 @@ def load_slot(sess, name, enc_path):
     info = money.scan(f.read_bytes())
     return {'file': name, 'inner': inner, 'subtitle': sfo.get('SUBTITLE', ''), 'revision': sfo.get('SAVEDATA_REVISION', b'').hex() if isinstance(sfo.get('SAVEDATA_REVISION'), bytes) else '',
             'dir': str(top), 'account': sfo['_account'], 'items': info['items'], 'ledger': info['ledger'], 'modified': False, 'changes': []}
+
+
+RESTORE_HOURS = float(os.environ.get('GSE_RESTORE_HOURS', 6))
+
+
+def restore_session():
+    """App 重启后接上最近一次下载，免得再按电源键重新下载。只读本地文件，不连主机、不联网。
+    已传回过、或超过 RESTORE_HOURS 小时的不接：玩家可能已在游戏里存了新档，改旧档会盖掉新进度。"""
+    sessions = sorted(p for p in (console_dir() / 'sessions').glob('*') if p.is_dir())
+    if not sessions:
+        return
+    sess = sessions[-1]
+    try:
+        age = time.time() - time.mktime(time.strptime(sess.name, '%Y%m%d-%H%M%S'))
+    except ValueError:
+        return
+    if age > RESTORE_HOURS * 3600 or (sess / 'uploaded').exists():
+        return
+    lib = sess / 'lib'
+    db = sqlite3.connect((lib / 'Transfer-Metadata' / 'metadata.db').as_uri() + '?mode=ro', uri=True)
+    try:
+        rows = db.execute('SELECT id, path FROM dir_entry_info_tbl ORDER BY id').fetchall()
+        names = {'%08x' % u: n or l or o for u, n, l, o in db.execute('SELECT user_id, user_name, login_id, online_id FROM user_info_tbl')}
+    finally:
+        db.close()
+    for entry_id, path in rows:                 # 和 job_download 一样取第一个 GTA 存档条目
+        parts = path.strip('/').split('/')
+        if len(parts) > 2 and parts[-1] in GTA_TITLES and (lib / 'Saves' / parts[2] / parts[-1]).is_dir():
+            owner, title = parts[2], parts[-1]
+            break
+    else:
+        return
+    slots = []
+    for f in sorted((lib / 'Saves' / owner / title).glob('sdimg_*')):
+        top = sess / 'dec' / f.name
+        if SLOT_RE.fullmatch(f.name) and top.is_dir():
+            s = read_slot(f.name, top)
+            orig = sess / 'orig' / f.name
+            s['modified'] = orig.is_file() and orig.read_bytes() != f.read_bytes()   # 传输库里已是改过的档
+            slots.append(s)
+    if not slots:
+        return
+    with LOCK:
+        STATE.update(session=str(sess), user={'id': owner, 'name': names.get(owner.lower(), 'user')}, entryId=entry_id, title=title,
+                     slots=slots, readyToUpload=any(s['modified'] for s in slots))
+    log('restored session ' + sess.name)
 
 
 def job_download():
@@ -285,7 +390,7 @@ def job_download():
     stage('decrypting')
     slots = []
     for f in imgs:
-        if re.fullmatch(r'sdimg_SAVEDATASARC\d+', f.name):
+        if SLOT_RE.fullmatch(f.name):
             slots.append(load_slot(sess, f.name, f))
     if not slots:
         raise Fail('no_story_slot')
@@ -326,7 +431,7 @@ def job_patch(slot_file, changes):
     stage('importing')
     run_tool(['poc.dt_local_saves', 'import', str(sess / 'lib'), str(STATE['entryId']), slot['file'], out])
     with LOCK:
-        slot['modified'] = True; slot['changes'] = [{'kind': next(x['kind'] for x in slot['items'] if x['inv'] == c['inv'] and x['idx'] == c['idx']),
+        slot['modified'] = True; slot['changes'] = [{'kind': next(x['kind'] for x in slot['items'] if money.same_item(x, c)),
                                                      'from': c['value'], 'to': int(c['newValue'])} for c in changes if int(c['newValue']) != c['value']]
         STATE['readyToUpload'] = True
     stage('ready_to_upload')
@@ -356,6 +461,8 @@ def job_upload():
            'DT_UPLOAD_KIND': 'save', 'DT_LOG': str(up / 'dt-source.log'), 'DT_PAIRING_PREFIX': str(prefix_path()), 'DT_EXPECTED_HOST_ID': c['hostId'],
            'DT_AUTO_POWER': '1', 'DT_PORT': '1004', 'DT_DATA_PORT': '1005', 'DT_DISCOVERY_PORT': '1006', "DT_HOST_NAME": "GTA6 Save Editor",
            'DT_ORACLE_HOST': '127.0.0.1', 'DT_ORACLE_PORT': str(relay().port), 'DT_SYSTEM_VERSION': c['firmware']}
+    if MAC:     # Mac 走 Wi-Fi 时常收不到主机的搜索广播：让传回程序主动向主机报到
+        env['DT_CONSOLE_IP'] = c['host']
     p = spawn(['poc.dt_source'], env=env)
     stage('waiting_console')
     files = 0; finished = False
@@ -388,6 +495,7 @@ def job_upload():
     if not (finished and files):
         raise Fail('upload_failed', 'process ended')
     time.sleep(3)
+    (sess / 'uploaded').touch()                 # 已传回的下载不再自动接上
     stage('uploaded')
     with LOCK:
         STATE['readyToUpload'] = False
@@ -471,6 +579,10 @@ class H(BaseHTTPRequestHandler):
                     STATE['console'] = {'host': c['host'], 'name': c['name'], 'hostId': c['hostId'], 'firmware': c['firmware']}
                     STATE.update(session=None, slots=[], readyToUpload=False, user=None, entryId=None)
                     refresh_paired()
+                    try:
+                        restore_session()
+                    except Exception as e:
+                        log('restore skipped: %r' % e)
                     (DATA / 'last_console.json').write_text(json.dumps({'host': c['host']}), 'utf-8')
                 return self._send(200, public_state())
             if path == '/api/network':

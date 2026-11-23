@@ -186,7 +186,9 @@ def pair(options, discovery_port=1006, command_port=1004, bind_ip=None):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as discovery, \
          socket.socket(socket.AF_INET, socket.SOCK_STREAM) as command:
         discovery.bind(("0.0.0.0", discovery_port))
-        command.bind((bind_ip, command_port))
+        # macOS lets a normal user bind ports below 1024 only on the wildcard
+        # address. The accept loop below already drops non-PS5 peers.
+        command.bind(("0.0.0.0" if sys.platform == "darwin" else bind_ip, command_port))
         command.listen(1)
         drop_privileges_from_environment()
         emit("status", message="Pairing listener ready. Select GarlicTransfer Pairing on the PS5.")

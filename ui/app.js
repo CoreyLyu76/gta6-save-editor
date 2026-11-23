@@ -31,7 +31,7 @@
     return [...slots].sort((a,b)=>String(b.revision ?? '').localeCompare(String(a.revision ?? ''),'en',{numeric:true}))[0];
   }
   function currentSlot() { return state?.slots?.find(s=>s.file === selected); }
-  function itemKey(item) { return `${item.inv}:${item.idx}`; }
+  function itemKey(item) { return `${item.src || 'inv'}:${item.inv}:${item.idx}`; }
   function syncDraft() {
     const slots = state?.slots || [];
     if (!slots.some(s=>s.file === selected)) selected = latest(slots)?.file || '';
@@ -47,7 +47,7 @@
     return /^\d+$/.test(raw) && Number(raw) <= 8000000 ? Number(raw) : null;
   }
   function getChanges() {
-    return (currentSlot()?.items || []).map(i=>({...i,newValue:parseAmount(draft[itemKey(i)])}));
+    return (currentSlot()?.items || []).map(i=>{ const v = parseAmount(draft[itemKey(i)]); return {...i,newValue:v === null ? null : Math.min(v, i.max ?? v)}; });
   }
   function canPatch() { const changes = getChanges(); return changes.length > 0 && changes.every(i=>i.newValue !== null) && changes.some(i=>i.newValue !== i.value); }
   function button(label, action, style = '', disabled = false, extra = '') {
@@ -77,8 +77,8 @@
     return heading(t('downloadTitle'),t('downloadDesc'),1)+`<div class="card-body"><div class="empty-visual"><div class="console-glyph" aria-hidden="true"></div></div><div class="instruction">${esc(t('downloadInfo'))}<span class="route">${esc(t('restartInfo'))}</span></div><div class="actions"><span class="muted small">${esc(state.job?.stage === 'paired' ? copy().stages.paired : '')}</span>${button(t('download'),'download','primary',blocked())}</div></div>`;
   }
   function moneyRow(item,index) {
-    const key = itemKey(item), label = `${t(item.kind in {bank:1,cash:1} ? item.kind : 'other')} · ${t('character')} ${Number(item.inv)+1}`;
-    return `<div class="money-row"><label class="money-label" for="amount-${index}"><span class="money-icon" aria-hidden="true">${item.kind === 'bank' ? '▤' : '$'}</span><span>${esc(t(item.kind in {bank:1,cash:1} ? item.kind : 'other'))}<small>${esc(t('character'))} ${Number(item.inv)+1}${item.kind === 'other' ? ' · #'+esc(item.idx) : ''}</small></span></label><span class="current mono">${money(item.value)}</span><span class="arrow" aria-hidden="true">→</span><input class="money-input" id="amount-${index}" data-money="${esc(key)}" value="${esc(draft[key])}" inputmode="numeric" autocomplete="off" aria-label="${esc(label+' · '+t('target'))}" aria-describedby="amount-error cap-note" aria-invalid="${parseAmount(draft[key]) === null}" ${blocked() ? 'disabled' : ''}></div>`;
+    const key = itemKey(item), label = `${t(item.kind in {bank:1,cash:1,savings:1} ? item.kind : 'other')} · ${t('character')} ${Number(item.inv)+1}`;
+    return `<div class="money-row"><label class="money-label" for="amount-${index}"><span class="money-icon" aria-hidden="true">${item.kind === 'bank' ? '▤' : item.kind === 'savings' ? '⤒' : '$'}</span><span>${esc(t(item.kind in {bank:1,cash:1,savings:1} ? item.kind : 'other'))}<small>${esc(t('character'))} ${Number(item.inv)+1}${item.kind === 'other' ? ' · #'+esc(item.idx) : ''}</small></span></label><span class="current mono">${money(item.value)}</span><span class="arrow" aria-hidden="true">→</span><input class="money-input" id="amount-${index}" data-money="${esc(key)}" value="${esc(draft[key])}" inputmode="numeric" autocomplete="off" aria-label="${esc(label+' · '+t('target'))}" aria-describedby="amount-error cap-note" aria-invalid="${parseAmount(draft[key]) === null}" ${blocked() ? 'disabled' : ''}></div>`;
   }
   function editView() {
     const slots = state.slots || [], slot = currentSlot(), newest = latest(slots);
@@ -247,7 +247,7 @@
     if (action === 'upload' && (!deleted || subnetMismatch())) { localError = null; dismissedError = errorKey(); render(); return; }
     if (action === 'patch') {
       if (!canPatch()) return;
-      body = {slot:selected,changes:getChanges().filter(i=>i.newValue !== i.value).map(({inv,idx,value,newValue})=>({inv,idx,value,newValue}))};
+      body = {slot:selected,changes:getChanges().filter(i=>i.newValue !== i.value).map(({src,inv,idx,value,newValue})=>({src,inv,idx,value,newValue}))};
     }
     if (MOCK) { mockAction(action); return; }
     pending = true; localError = null; dismissedError = errorKey(); mutation++; render();
@@ -275,7 +275,7 @@
       setScenario(all[(index+(action === 'next' ? 1 : -1)+all.length)%all.length].id); return;
     }
     if (action === 'slot' && !blocked()) { selected = state.slots[Number(el.dataset.index)].file; render(); return; }
-    if (action === 'max' && !blocked()) { for (const i of currentSlot().items) if (['bank','cash'].includes(i.kind)) draft[itemKey(i)] = '8,000,000'; render(); return; }
+    if (action === 'max' && !blocked()) { for (const i of currentSlot().items) if (['bank','cash','savings'].includes(i.kind)) draft[itemKey(i)] = money(i.max ?? 8000000); render(); return; }
     if (action === 'console') { void perform('console',{host:consoles[Number(el.dataset.index)].host}); return; }
     if (action === 'recover') { void perform(el.dataset.recovery,localError?.body || {}); return; }
     void perform(action);
