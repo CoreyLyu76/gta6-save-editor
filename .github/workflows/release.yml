@@ -1,0 +1,55 @@
+# Builds the Windows and macOS packages and attaches them to a release.
+# Runs when a release is published, or by hand for an existing tag.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach to (for example v0.2.0)
+        required: true
+      only:
+        description: all, windows or macos
+        default: all
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  windows:
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'windows' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt pyinstaller
+      - run: .\build.bat
+        shell: cmd
+      - run: Compress-Archive -Path build_out\dist\GTA6SaveEditor -DestinationPath GTA6SaveEditor-windows.zip
+      - run: gh release upload $env:TAG GTA6SaveEditor-windows.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  macos:
+    if: ${{ github.event_name == 'release' || inputs.only == 'all' || inputs.only == 'macos' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: ./build_mac.sh
+      - run: gh release upload "$TAG" build_out/dist/GTA6SaveEditor-mac.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
